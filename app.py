@@ -344,12 +344,14 @@ def call_gemma(location, lat, lon, events, dm_bg, dm_rec, level, api_key=None):
         for e in events[:6]
     ) or "  No events.\n"
 
+    bg_line = f"Delta_mean background (8-30 days): {dm_bg:.4f}\n" if dm_bg else "Delta_mean background: insufficient data\n"
+    rec_line = f"Delta_mean recent (last 7 days): {dm_rec:.4f}\n" if dm_rec else "Delta_mean recent: insufficient data\n"
     user_msg = (
         f"Location: {location} (lat={lat:.3f}, lon={lon:.3f})\n"
         f"Total events last 30 days: {len(events)}\n"
         f"Recent events:\n{event_lines}"
-        f"Delta_mean background (8-30 days): {dm_bg:.4f}\n" if dm_bg else ""
-        f"Delta_mean recent (last 7 days): {dm_rec:.4f}\n" if dm_rec else ""
+        f"{bg_line}"
+        f"{rec_line}"
         f"Change: {drop_str}\n\nPlease assess seismic risk."
     )
 
@@ -552,6 +554,4 @@ if analyze:
         }, index=times_ts)
         st.line_chart(df_ts)
         st.caption(
-            "Downward trend = inter-event timing regularizing = resonant stress-release mode. "
-            "Ridgecrest Mw7.1: Delta_mean reached 0.119 before mainshock. "
-         
+            "Downward trend = inter-event tim
