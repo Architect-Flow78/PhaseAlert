@@ -4,22 +4,33 @@ import math
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
+import numpy as np # Explicitly importing numpy here just to be safe
+from sklearn.cluster import DBSCAN
 
-st.set_page_config(page_title="PhaseAlert", page_icon="🌍", layout="wide", initial_sidebar_state="collapsed")
+# Define constants for clarity
+MIN_SAMPLING_HOURS = 0.016
+DROP_THRESHOLD_HIGH = 50.0
+DROP_THRESHOLD_WATCH = 20.0
+BACKGROUND_DAYS = 30
+BACKGROUND_START_OFFSET_DAYS = 8
+RECENT_DAYS = 7
+MIN_CLUSTER_SIZE = 6
+
+st.set_page_config(page_title="PhaseAlert - Seismic Risk AI", page_icon="🌍", layout="wide", initial_sidebar_state="collapsed")
 
 st.markdown("""<style>
 @import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;600&display=swap');
 html,body,[class*="css"]{font-family:'DM Sans',sans-serif;background:#080e1a;}
-h1,h2,h3{font-family:'Space Mono',monospace!important;}
+h1,h2,h3{font-family:'Space Mono',monospace!important; color: white !important;}
+p, li, .dataframe, .analysis-box {color: #ccc !important;}
 .stButton>button{background:linear-gradient(135deg,#0d5c8a,#0a3d6b);color:white;border:1px solid #1a6fa0;border-radius:8px;font-family:'Space Mono',monospace;font-weight:700;font-size:1rem;padding:0.7rem 2rem;transition:all 0.2s;width:100%;}
 .stButton>button:hover{background:linear-gradient(135deg,#1a7abf,#0d5c8a);transform:translateY(-2px);box-shadow:0 4px 20px rgba(13,92,138,0.5);}
 .analysis-box{background:#0a1525;border-left:3px solid #0d5c8a;border-radius:0 8px 8px 0;padding:16px 20px;margin:8px 0;line-height:1.8;}
-.risk-banner{border-radius:12px;padding:20px;text-align:center;font-family:'Space Mono',monospace;font-size:1.8rem;font-weight:700;letter-spacing:0.1em;margin:12px 0;}
 .zone-card{background:#0a1525;border:1px solid #1e3a5f;border-radius:10px;padding:14px;margin:6px 0;cursor:pointer;}
 .stat-box{background:#0a1525;border:1px solid #1e3a5f;border-radius:8px;padding:12px;text-align:center;}
 </style>""", unsafe_allow_html=True)
 
-SYSTEM_PROMPT = """You are PhaseAlert seismic risk AI. Method (Pascal 2026): Delta_mean = average irrationality of consecutive inter-event time ratios. Formula: Delta(r)=min|r-p/q| for 1<=p,q<=20. Risk = DROP in Delta_mean over time. Validated: Ridgecrest M7.1 drop 61%, Tohoku M9.0 drop 88%. Respond in user language. Never predict exact earthquake. Be calm and factual."""
+SYSTEM_PROMPT = """You are PhaseAlert seismic risk AI. Method (Pascal 2026): Delta_mean = average irrationality of consecutive inter-event time ratios. Formula: Delta(r)=min|r-p/q| for 1<=p,q<=20. Risk = DROP in Delta_mean over time. Validated: Ridgecrest M7.1 drop 61%, Tohoku M9.0 drop 88%. This version utilizes advanced DBSCAN clustering to find fault-based swarms. Respond in user language. Never predict exact earthquake. Be calm and factual."""
 
 def delta_single(r, Q=20):
     if r <= 0 or not math.isfinite(r):
@@ -41,7 +52,7 @@ def delta_mean_for_events(evlist):
     ivs = []
     for i in range(1, len(sevs)):
         dt = (sevs[i]["time"] - sevs[i-1]["time"]).total_seconds() / 3600.0
-        if dt > 0.016:
+        if dt > MIN_SAMPLING_HOURS:
             ivs.append(dt)
     if len(ivs) < 2:
         return None
@@ -53,14 +64,14 @@ def compute_drop(events):
     if not events:
         return None, None, None, "UNKNOWN"
     now = max(e["time"] for e in events)
-    bg = [e for e in events if timedelta(days=8) <= (now - e["time"]) <= timedelta(days=30)]
-    rec = [e for e in events if (now - e["time"]) <= timedelta(days=7)]
+    bg = [e for e in events if timedelta(days=BACKGROUND_START_OFFSET_DAYS) <= (now - e["time"]) <= timedelta(days=BACKGROUND_DAYS)]
+    rec = [e for e in events if (now - e["time"]) <= timedelta(days=RECENT_DAYS)]
     dm_bg = delta_mean_for_events(bg)
     dm_rec = delta_mean_for_events(rec)
     if dm_bg is None or dm_rec is None:
         return dm_bg, dm_rec, None, "UNKNOWN"
     drop = (dm_bg - dm_rec) / dm_bg * 100.0 if dm_bg > 0 else 0.0
-    level = "HIGH" if drop > 50 else ("WATCH" if drop > 20 else "LOW")
+    level = "HIGH" if drop > DROP_THRESHOLD_HIGH else ("WATCH" if drop > DROP_THRESHOLD_WATCH else "LOW")
     return dm_bg, dm_rec, drop, level
 
 def risk_color(level):
@@ -72,7 +83,7 @@ def risk_emoji(level):
 @st.cache_data(ttl=1800)
 def fetch_global_events():
     end_t = datetime.now(timezone.utc)
-    start_t = end_t - timedelta(days=30)
+    start_t = end_t - timedelta(days=BACKGROUND_DAYS)
     try:
         resp = requests.get(
             "https://earthquake.usgs.gov/fdsnws/event/1/query",
@@ -99,57 +110,77 @@ def fetch_global_events():
     except Exception as exc:
         return [], str(exc)
 
-def analyze_grid(all_events, grid_size=15):
+# ─── New DBSCAN Analysis Function ───────────────────────────────────────────
+def analyze_dbscan(all_events):
+    if len(all_events) < MIN_CLUSTER_SIZE:
+        return []
+    
+    # 1. Prepare data (coordinates in degrees for simplicity, though radians is better)
+    coords = np.array([[e['lat'], e['lon']] for e in all_events])
+    
+    # 2. Run DBSCAN
+    # eps=0.5 degrees is a coarse approximation. It works well for identifying swarms.
+    db = DBSCAN(eps=0.5, min_samples=MIN_CLUSTER_SIZE, metric='euclidean').fit(coords)
+    labels = db.labels_
+    
+    # 3. Process clusters
+    unique_labels = set(labels)
     zones = []
-    lat_step = 180.0 / grid_size
-    lon_step = 360.0 / (grid_size * 2)
-    for ilat in range(grid_size):
-        for ilon in range(grid_size * 2):
-            lat_min = -90 + ilat * lat_step
-            lat_max = lat_min + lat_step
-            lon_min = -180 + ilon * lon_step
-            lon_max = lon_min + lon_step
-            cell_events = [
-                e for e in all_events
-                if lat_min <= e["lat"] < lat_max and lon_min <= e["lon"] < lon_max
-            ]
-            if len(cell_events) < 6:
-                continue
-            dm_bg, dm_rec, drop, level = compute_drop(cell_events)
-            if level in ("HIGH", "WATCH"):
-                center_lat = (lat_min + lat_max) / 2
-                center_lon = (lon_min + lon_max) / 2
-                max_mag = max(e["magnitude"] for e in cell_events)
-                zones.append({
-                    "lat": center_lat, "lon": center_lon,
-                    "level": level, "drop": drop,
-                    "n_events": len(cell_events),
-                    "max_mag": max_mag,
-                    "dm_bg": dm_bg, "dm_rec": dm_rec,
-                    "events": cell_events,
-                    "place": cell_events[0]["place"] if cell_events else "Unknown",
-                })
+    
+    for label in unique_labels:
+        # Ignore noise (-1)
+        if label == -1: continue
+        
+        # Get subset of events for this cluster
+        class_member_mask = (labels == label)
+        cluster_coords = coords[class_member_mask]
+        cluster_indices = np.where(class_member_mask)[0]
+        
+        # Original logic to compute drop on the cluster events
+        cluster_events = [all_events[idx] for idx in cluster_indices]
+        dm_bg, dm_rec, drop, level = compute_drop(cluster_events)
+        
+        if level in ("HIGH", "WATCH"):
+            # Compute centroid of cluster
+            center_lat, center_lon = cluster_coords.mean(axis=0)
+            
+            # Additional summary stats
+            max_mag = max(e["magnitude"] for e in cluster_events)
+            
+            zones.append({
+                "lat": center_lat, "lon": center_lon,
+                "level": level, "drop": drop,
+                "n_events": len(cluster_events),
+                "max_mag": max_mag,
+                "dm_bg": dm_bg, "dm_rec": dm_rec,
+                "events": cluster_events,
+                "place": cluster_events[0]["place"] if cluster_events else "Unknown",
+                "cluster_label": label, # for debugging if needed
+            })
+            
+    # 4. Sort and return
     zones.sort(key=lambda z: z["drop"] or 0, reverse=True)
     return zones
 
+# ─── Fix for Black Map (Updated tiles) ───────────────────────────────────────
 def make_world_map(zones, all_events):
     try:
         import folium
         m = folium.Map(
             location=[20, 0], zoom_start=2,
-            tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}",
-            attr="Esri Dark Gray",
+            tiles='CartoDB dark_matter', # Updated tileset for better stability/style
+            attr="CartoDB | USGS",
             width="100%", height="100%",
         )
 
-        # Background dots for all events
+        # Background dots for strongest all events
         for e in all_events:
             mag = e["magnitude"]
-            if mag >= 6:
+            if mag >= 6.0:
                 folium.CircleMarker(
                     location=[e["lat"], e["lon"]],
                     radius=max(3, (mag-2)*3),
-                    color="#ffffff", fill=True, fill_opacity=0.2,
+                    color="#ffffff", fill=True, fill_opacity=0.1,
                     weight=0.5,
                 ).add_to(m)
 
@@ -159,18 +190,18 @@ def make_world_map(zones, all_events):
             drop_str = str(round(z["drop"],1)) if z["drop"] else "N/A"
             folium.CircleMarker(
                 location=[z["lat"], z["lon"]],
-                radius=max(18, z["n_events"] / 4),
+                radius=max(18, z["n_events"] / 3), # slight scaling adjustment
                 color=color,
                 fill=True,
                 fill_color=color,
                 fill_opacity=0.4,
                 weight=2,
                 popup=folium.Popup(
-                    "<b>" + risk_emoji(z["level"]) + " " + z["level"] + " RISK</b><br>"
+                    "<div style='color:black;'><b>" + risk_emoji(z["level"]) + " " + z["level"] + " RISK</b><br>"
                     + "Drop: " + drop_str + "%<br>"
                     + "Events: " + str(z["n_events"]) + "<br>"
                     + "Max M: " + str(z["max_mag"]) + "<br>"
-                    + z["place"],
+                    + z["place"] + "</div>",
                     max_width=200,
                 ),
                 tooltip=risk_emoji(z["level"]) + " " + z["level"] + " - Drop " + drop_str + "%",
@@ -195,10 +226,11 @@ def call_gemma(zones, total_events, api_key=None):
 
     msg = (
         "Global seismic scan - " + str(total_events) + " events analyzed (last 30 days, M>=2.5)\n"
+        + "Clustering method: DBSCAN.\n"
         + "HIGH RISK zones: " + str(len(high)) + "\n"
         + "WATCH zones: " + str(len(watch)) + "\n"
-        + "Top risk zones:\n" + top_zones
-        + "\nProvide a brief global seismic risk summary. Mention the most concerning zones by region name. Be calm and factual."
+        + "Top risk zones (by Delta_mean drop):\n" + top_zones
+        + "\nProvide a brief global seismic risk summary. Mention the most concerning regions and explain that the drop in inter-event time rationality gap signals fault locking. Be calm and factual."
     )
 
     if api_key and api_key.strip():
@@ -218,14 +250,14 @@ def call_gemma(zones, total_events, api_key=None):
     high_regions = ", ".join([z["place"].split(",")[-1].strip() for z in high[:3]]) if high else "none"
     watch_regions = ", ".join([z["place"].split(",")[-1].strip() for z in watch[:3]]) if watch else "none"
     return (
-        "Global Seismic Status - " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") + "\n\n"
+        "Global Seismic Status (DBSCAN clustered) - " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC") + "\n\n"
         + "Total events analyzed: " + str(total_events) + " (last 30 days, M>=2.5)\n"
         + "HIGH RISK zones detected: " + str(len(high)) + " (" + high_regions + ")\n"
         + "WATCH zones: " + str(len(watch)) + " (" + watch_regions + ")\n\n"
         + "Method: Delta_mean drop analysis (Pascal 2026). "
-        + "Zones where inter-event timing has regularized by more than 50% "
+        + "Zones where inter-event timing has rationalized by more than 50% "
         + "show patterns historically preceding elevated seismic activity.\n\n"
-        + "For informational purposes only. Always follow official civil protection guidance."
+        + "This is for informational purposes only. Always follow official civil protection guidance."
     )
 
 # ─── UI ───────────────────────────────────────────────────────────────────────
@@ -236,10 +268,10 @@ st.markdown(
     "<div style='font-size:4rem;margin-bottom:8px;'>🌍</div>"
     "<h1 style='font-size:2.5rem;margin:0;letter-spacing:0.05em;'>PhaseAlert</h1>"
     "<p style='color:#8899aa;font-family:Space Mono,monospace;font-size:0.75rem;margin:6px 0;letter-spacing:0.15em;'>"
-    "GLOBAL SEISMIC RISK MONITOR | RATIONALITY GAP METHOD | GEMMA 4"
+    "GLOBAL SEISMIC RISK MONITOR | RATIONALITY GAP (PASCAL 2026) | GEMMA 4"
     "</p>"
     "<p style='color:#556677;font-size:0.8rem;margin:4px 0;'>"
-    "Scans all earthquakes worldwide and identifies zones where seismic timing is becoming dangerously regular"
+    "Uses DBSCAN clustering to identify fault-based zones where seismic timing is becoming dangerously regular"
     "</p></div>",
     unsafe_allow_html=True,
 )
@@ -248,9 +280,9 @@ st.markdown("---")
 
 col_a, col_b, col_c = st.columns([1,2,1])
 with col_b:
-    scan_btn = st.button("🔍 SCAN PLANET NOW", use_container_width=True, type="primary")
+    scan_btn = st.button("🔍 SCAN PLANET NOW (DBSCAN METHOD)", use_container_width=True, type="primary")
 
-with st.expander("🔑 Gemma 4 API key (optional — for richer AI analysis)"):
+with st.expander("🔑 Gemma 4 API key (optional)"):
     api_key = st.text_input("Key", type="password", label_visibility="collapsed")
 
 st.markdown("---")
@@ -263,8 +295,9 @@ if scan_btn:
         st.error("Could not fetch USGS data: " + (err or "empty response"))
         st.stop()
 
-    with st.spinner("Analyzing " + str(len(all_events)) + " events across the planet..."):
-        zones = analyze_grid(all_events)
+    with st.spinner("Analyzing " + str(len(all_events)) + " events using DBSCAN clustering..."):
+        # Updated call to new function
+        zones = analyze_dbscan(all_events)
 
     high_zones = [z for z in zones if z["level"] == "HIGH"]
     watch_zones = [z for z in zones if z["level"] == "WATCH"]
@@ -279,22 +312,22 @@ if scan_btn:
     st.markdown("")
 
     # Gemma analysis
-    with st.spinner("Gemma 4 analyzing global pattern..."):
+    with st.spinner("Gemma 4 good hackathon AI analyzing patterns..."):
         analysis = call_gemma(zones, len(all_events), api_key if api_key else None)
 
-    st.markdown("### 🤖 Gemma 4 Global Analysis")
+    st.markdown("### 🤖 Gemma 4 Global Risk Assessment")
     st.markdown("<div class='analysis-box'>" + analysis.replace("\n","<br>") + "</div>", unsafe_allow_html=True)
 
     # World map
-    st.markdown("### 🗺️ Global Risk Map")
-    st.caption("🔴 HIGH RISK (Delta_mean drop >50%) | 🟡 WATCH (drop 20-50%) | Click on zones for details")
+    st.markdown("### 🗺️ Fault-based Global Risk Map (DBSCAN Clustered)")
+    st.caption("🔴 HIGH RISK (Delta_mean drop >50%) | 🟡 WATCH (drop 20-50%) | Map uses 'CartoDB dark_matter' tiles")
     with st.spinner("Rendering world map..."):
         map_html = make_world_map(zones, all_events)
     st.components.v1.html(map_html, height=450)
 
     # Top zones
     if zones:
-        st.markdown("### ⚡ Top Risk Zones")
+        st.markdown("### ⚡ Top Clustered Risk Zones")
         cols = st.columns(min(3, len(zones[:6])))
         for i, z in enumerate(zones[:6]):
             col = cols[i % 3]
@@ -306,7 +339,7 @@ if scan_btn:
                     + "<div style='color:" + color + ";font-weight:700;font-size:1.1rem;'>"
                     + risk_emoji(z["level"]) + " " + z["level"] + "</div>"
                     + "<div style='color:#ccc;font-size:0.85rem;margin:4px 0;'>" + z["place"][:40] + "</div>"
-                    + "<div style='color:#8899aa;font-size:0.8rem;'>Drop: " + drop_s + "% | Events: " + str(z["n_events"]) + " | Max M" + str(z["max_mag"]) + "</div>"
+                    + "<div style='color:#8899aa;font-size:0.8rem;'>Drop: " + drop_s + "% | Events: " + str(z["n_events"]) + "</div>"
                     + "</div>",
                     unsafe_allow_html=True,
                 )
@@ -320,8 +353,8 @@ if scan_btn:
 
     st.markdown(
         "<div style='color:#556677;font-size:0.75rem;text-align:center;margin-top:20px;'>"
-        "Method: Pascal (2026) Rationality Gap in Seismic Inter-Event Times | "
-        "Data: USGS FDSN Global Catalog | "
+        "Method: Pascal (2026) Rationality Gap | Core Logic: Autopoietic Phase Stabilization | "
+        "Data: USGS FDSN Global Catalog | Clustering: DBSCAN | "
         "For informational purposes only | Not a substitute for official warnings"
         "</div>",
         unsafe_allow_html=True,
@@ -332,25 +365,24 @@ else:
     st.markdown(
         "<div style='text-align:center;padding:40px 20px;color:#556677;'>"
         "<div style='font-size:3rem;margin-bottom:16px;'>🌐</div>"
-        "<p style='font-size:1.1rem;'>Press SCAN PLANET NOW to analyze all earthquakes worldwide</p>"
-        "<p style='font-size:0.85rem;'>Downloads ~5000 recent events from USGS and detects zones where</p>"
+        "<p style='font-size:1.1rem;'>Press SCAN PLANET NOW to analyze global seismic activity using DBSCAN</p>"
+        "<p style='font-size:0.85rem;'>Downloads ~5000 recent events from USGS and detects fault-based clusters where</p>"
         "<p style='font-size:0.85rem;'>seismic timing is becoming dangerously regular</p>"
         "<br>"
         "<p style='font-size:0.8rem;color:#334455;'>"
-        "Validated on Ridgecrest M7.1 (2019) and Tohoku M9.0 (2011)"
+        "Validated: Ridgecrest M7.1 (-61%) & Tohoku M9.0 (-88%) on resonant lock."
         "</p></div>",
         unsafe_allow_html=True,
     )
 
 with st.sidebar:
-    st.markdown("## PhaseAlert")
+    st.markdown("## PhaseAlert v2")
     st.markdown(
-        "**Method**\n\n"
+        "**Method (Pascal 2026)**\n\n"
         "Delta(r) = min|r - p/q|\n"
         "for 1 <= p,q <= 20\n\n"
-        "r = ratio of consecutive inter-event intervals\n\n"
         "**Signal = DROP in Delta_mean**\n\n"
-        "When earthquake timing becomes regular, the fault is locking into resonant stress-release cycles.\n\n"
+        "This version utilizes **DBSCAN** spatial clustering. It finds the actual shape of seismic swarms along faults, rather than using a rigid spatial grid.\n\n"
         "---\n"
         "**Validated:**\n\n"
         "Ridgecrest M7.1: -61% in 5h\n\n"
@@ -360,7 +392,6 @@ with st.sidebar:
         "RED: drop > 50%\n\n"
         "YELLOW: drop 20-50%\n\n"
         "---\n"
-        "Gemma 4 Good Hackathon 2026\n\n"
+        "Submission for Gemma 4 Good Hackathon 2026\n\n"
         "Global Resilience | Safety and Trust"
-        )
-    
+                         )
