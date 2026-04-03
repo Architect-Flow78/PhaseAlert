@@ -2,7 +2,8 @@ import streamlit as st
 import requests
 import math
 import json
-from datetime import datetime, timedelta
+import pandas as pd
+from datetime import datetime, timedelta, timezone
 
 # ─────────────────────────────────────────
 # PAGE CONFIG
@@ -10,90 +11,160 @@ from datetime import datetime, timedelta
 st.set_page_config(
     page_title="PhaseAlert",
     page_icon="🌍",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
+
+# ─────────────────────────────────────────
+# CUSTOM CSS — dark seismic aesthetic
+# ─────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=DM+Sans:wght@300;400;600&display=swap');
+
+html, body, [class*="css"] {
+    font-family: 'DM Sans', sans-serif;
+}
+
+.main { background: #0a0e1a; }
+
+h1, h2, h3 {
+    font-family: 'Space Mono', monospace !important;
+    letter-spacing: -0.02em;
+}
+
+.stButton > button {
+    background: linear-gradient(135deg, #1a3a5c, #0d5c8a);
+    color: white;
+    border: none;
+    border-radius: 8px;
+    font-family: 'Space Mono', monospace;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    padding: 0.6rem 1.2rem;
+    transition: all 0.2s;
+}
+.stButton > button:hover {
+    background: linear-gradient(135deg, #0d5c8a, #0a7abf);
+    transform: translateY(-1px);
+    box-shadow: 0 4px 20px rgba(13,92,138,0.4);
+}
+
+.metric-card {
+    background: #0f1929;
+    border: 1px solid #1e3a5f;
+    border-radius: 12px;
+    padding: 20px;
+    text-align: center;
+}
+
+.risk-banner {
+    border-radius: 12px;
+    padding: 24px;
+    text-align: center;
+    font-family: 'Space Mono', monospace;
+    font-size: 2rem;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    margin: 16px 0;
+}
+
+.analysis-box {
+    background: #0f1929;
+    border-left: 3px solid #0d5c8a;
+    border-radius: 0 8px 8px 0;
+    padding: 20px;
+    margin: 12px 0;
+    font-size: 0.95rem;
+    line-height: 1.7;
+}
+
+.event-row {
+    display: flex;
+    justify-content: space-between;
+    padding: 8px 0;
+    border-bottom: 1px solid #1e3a5f;
+    font-size: 0.85rem;
+}
+</style>
+""", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────
 # GEMMA 4 SYSTEM PROMPT
 # ─────────────────────────────────────────
-GEMMA_SYSTEM_PROMPT = """You are PhaseAlert, a seismic risk analyzer.
-
-You analyze seismic data using the Gap Parameter (Delta), a number theory measure of how irrational the frequency ratios of seismic events are.
+GEMMA_SYSTEM_PROMPT = """You are PhaseAlert, a seismic risk analyzer using the Gap Parameter method.
 
 FORMULA:
-Delta = min|r - p/q| for all integers p,q where q <= 15
-where r = ratio between consecutive seismic event frequencies in a region
+Gap Parameter Delta = min|r - p/q| for integers p,q where q <= 15
+r = ratio between consecutive inter-event time intervals
 
-RISK THRESHOLDS:
-- Delta > 0.030 → LOW RISK. Frequency ratios are irrational. System is stable.
-- Delta 0.010–0.030 → WATCH ZONE. Ratios approaching rational values. Monitor closely.
-- Delta < 0.010 → HIGH RISK. Frequency ratios nearly rational. Historical pattern precedes elevated activity.
+THRESHOLDS:
+- Delta > 0.030 → LOW RISK: irrational ratios, stable phase configuration
+- Delta 0.010–0.030 → WATCH: approaching rational ratios, monitor
+- Delta < 0.010 → HIGH RISK: near-rational ratios, historical precursor pattern
 
-VALIDATED CASES:
-- Ridgecrest 2019 (M7.1): Delta dropped to 0.007 in 72h before main event
-- Tohoku 2011 (M9.0): Delta dropped to 0.004 in 96h before main event
+VALIDATED:
+- Ridgecrest 2019 M7.1: Delta=0.007 in 72h before event
+- Tohoku 2011 M9.0: Delta=0.004 in 96h before event
 
-YOUR TASK:
-1. Receive: location name, coordinates, list of recent seismic events with magnitudes and times
-2. Calculate: Delta from the frequency ratios of the events
-3. Output: risk level, plain explanation, and what the person should do
-4. Language: respond in the same language the user writes in
-5. Tone: calm, clear, factual. Never cause panic. Always give practical advice.
-
-FORMAT YOUR RESPONSE AS:
+YOUR RESPONSE FORMAT (always use exactly this):
 🌍 Location: [name]
-⚡ Risk Level: LOW / WATCH / HIGH
-📊 Gap Parameter Delta: [value]
-📝 Analysis: [2-3 sentences explaining what the data shows]
-✅ Recommendation: [what the person should do]"""
+⚡ Risk Level: [LOW/WATCH/HIGH]
+📊 Gap Parameter Δ: [value]
+📝 Analysis: [2-3 sentences, plain language]
+✅ Recommendation: [specific practical advice]
 
+RULES:
+- Respond in the same language the user writes in
+- Never cause panic
+- Always calm, factual, actionable
+- Never say "earthquake will happen" — say "elevated risk pattern detected"
+"""
 
 # ─────────────────────────────────────────
-# GAP PARAMETER ENGINE
+# GAP PARAMETER ENGINE — FIXED
 # ─────────────────────────────────────────
 def gap_parameter(r, Q=15):
-    """Core TPM formula: Delta = min|r - p/q|"""
-    if r <= 0:
-        return 0.0
+    """Delta = min|r - p/q|. Always positive."""
+    if r <= 0 or math.isnan(r) or math.isinf(r):
+        return None
     best = float('inf')
     for q in range(1, Q + 1):
         p = round(r * q)
         if p > 0:
-            best = min(best, abs(r - p / q))
-    return round(best, 6)
+            d = abs(r - p / q)
+            if d < best:
+                best = d
+    return round(best, 6) if best < float('inf') else None
 
 
-def compute_delta_from_events(events):
+def compute_delta(events):
     """
-    Compute Gap Parameter from seismic event sequence.
-    Uses time intervals between events as frequency proxy.
+    Compute Gap Parameter from event sequence.
+    FIX: uses absolute time differences, not signed ratios.
     """
-    if len(events) < 3:
+    if len(events) < 4:
         return None, []
 
-    # Sort by time
-    events_sorted = sorted(events, key=lambda x: x['time'])
+    sorted_ev = sorted(events, key=lambda x: x['time'])
 
-    # Compute time intervals in hours
+    # Inter-event intervals in hours — always positive
     intervals = []
-    for i in range(1, len(events_sorted)):
-        t1 = events_sorted[i - 1]['time']
-        t2 = events_sorted[i]['time']
-        dt = (t2 - t1).total_seconds() / 3600.0
-        if dt > 0:
+    for i in range(1, len(sorted_ev)):
+        dt = (sorted_ev[i]['time'] - sorted_ev[i-1]['time']).total_seconds() / 3600.0
+        if dt > 0.01:  # minimum 1 minute gap
             intervals.append(dt)
 
-    if len(intervals) < 2:
+    if len(intervals) < 3:
         return None, []
 
-    # Compute ratios of consecutive intervals
-    ratios = []
+    # Ratios of consecutive intervals — always positive
     deltas = []
     for i in range(1, len(intervals)):
-        if intervals[i - 1] > 0:
-            r = intervals[i] / intervals[i - 1]
-            ratios.append(r)
-            deltas.append(gap_parameter(r))
+        r = intervals[i] / intervals[i-1]
+        d = gap_parameter(r)
+        if d is not None:
+            deltas.append(d)
 
     if not deltas:
         return None, []
@@ -104,282 +175,345 @@ def compute_delta_from_events(events):
 
 def risk_level(delta):
     if delta is None:
-        return "UNKNOWN", "⚪"
+        return "UNKNOWN", "⚪", "#6c757d"
     if delta > 0.030:
-        return "LOW", "🟢"
+        return "LOW", "🟢", "#28a745"
     elif delta > 0.010:
-        return "WATCH", "🟡"
+        return "WATCH", "🟡", "#ffc107"
     else:
-        return "HIGH", "🔴"
+        return "HIGH", "🔴", "#dc3545"
 
 
 # ─────────────────────────────────────────
 # USGS API
 # ─────────────────────────────────────────
-def fetch_usgs_events(lat, lon, radius_km=500, days=30, min_mag=2.0):
-    """Fetch recent seismic events from USGS open API"""
-    end_time = datetime.utcnow()
-    start_time = end_time - timedelta(days=days)
-
+def fetch_usgs(lat, lon, radius_km=500, days=30, min_mag=2.5):
+    end = datetime.now(timezone.utc)
+    start = end - timedelta(days=days)
     url = "https://earthquake.usgs.gov/fdsnws/event/1/query"
     params = {
         "format": "geojson",
-        "starttime": start_time.strftime("%Y-%m-%d"),
-        "endtime": end_time.strftime("%Y-%m-%d"),
-        "latitude": lat,
-        "longitude": lon,
+        "starttime": start.strftime("%Y-%m-%d"),
+        "endtime": end.strftime("%Y-%m-%d"),
+        "latitude": lat, "longitude": lon,
         "maxradiuskm": radius_km,
         "minmagnitude": min_mag,
-        "orderby": "time",
-        "limit": 100
+        "orderby": "time", "limit": 100
     }
-
     try:
-        r = requests.get(url, params=params, timeout=10)
+        r = requests.get(url, params=params, timeout=12)
         r.raise_for_status()
         data = r.json()
         events = []
         for f in data.get("features", []):
-            props = f["properties"]
-            coords = f["geometry"]["coordinates"]
-            ts = props["time"] / 1000  # ms to seconds
+            p = f["properties"]
+            c = f["geometry"]["coordinates"]
+            ts = p["time"] / 1000
             events.append({
-                "time": datetime.utcfromtimestamp(ts),
-                "magnitude": props["mag"],
-                "place": props["place"],
-                "depth": coords[2],
-                "lat": coords[1],
-                "lon": coords[0]
+                "time": datetime.fromtimestamp(ts, tz=timezone.utc),
+                "magnitude": p["mag"],
+                "place": p["place"] or "Unknown",
+                "depth": round(c[2], 1),
+                "lat": c[1], "lon": c[0]
             })
         return events, None
     except Exception as e:
         return [], str(e)
 
 
-def geocode_location(location_name):
-    """Convert city name to coordinates using nominatim"""
+def geocode(name):
     try:
-        url = "https://nominatim.openstreetmap.org/search"
-        params = {"q": location_name, "format": "json", "limit": 1}
-        headers = {"User-Agent": "PhaseAlert/1.0"}
-        r = requests.get(url, params=params, headers=headers, timeout=8)
-        results = r.json()
-        if results:
-            return float(results[0]["lat"]), float(results[0]["lon"]), results[0]["display_name"]
-        return None, None, None
+        r = requests.get(
+            "https://nominatim.openstreetmap.org/search",
+            params={"q": name, "format": "json", "limit": 1},
+            headers={"User-Agent": "PhaseAlert/2.0"},
+            timeout=8
+        )
+        res = r.json()
+        if res:
+            return float(res[0]["lat"]), float(res[0]["lon"]), res[0]["display_name"]
     except:
-        return None, None, None
+        pass
+    return None, None, None
 
 
 # ─────────────────────────────────────────
-# GEMMA 4 CALL (via Kaggle / local)
+# GEMMA 4 CALL
 # ─────────────────────────────────────────
-def call_gemma(location_name, lat, lon, events, delta, risk, api_key=None):
-    """
-    Call Gemma 4 API with seismic data.
-    Falls back to rule-based response if no API key.
-    """
-    event_summary = ""
-    if events:
-        recent = events[:5]
-        for e in recent:
-            event_summary += f"  - M{e['magnitude']} at {e['place']} on {e['time'].strftime('%Y-%m-%d %H:%M')}\n"
-    else:
-        event_summary = "  No significant events in this period.\n"
+def call_gemma(location, lat, lon, events, delta, api_key=None):
+    level, emoji, color = risk_level(delta)
 
-    user_message = f"""
-Location: {location_name} (lat={lat:.2f}, lon={lon:.2f})
-Recent seismic events (last 30 days, radius 500km):
-{event_summary}
-Computed Gap Parameter (Delta): {delta}
-Number of events analyzed: {len(events)}
+    event_lines = ""
+    for e in events[:8]:
+        event_lines += f"  M{e['magnitude']} | {e['place']} | {e['time'].strftime('%Y-%m-%d %H:%M UTC')}\n"
+    if not event_lines:
+        event_lines = "  No events found in this period.\n"
 
-Please provide seismic risk assessment.
-"""
+    user_msg = f"""Location: {location} (lat={lat:.3f}, lon={lon:.3f})
+Events last 30 days (radius 500km, M≥2.5):
+{event_lines}
+Total events: {len(events)}
+Computed Gap Parameter Δ: {delta if delta is not None else 'insufficient data'}
 
-    # If API key provided — call real Gemma 4
-    if api_key:
+Please provide seismic risk assessment."""
+
+    if api_key and api_key.strip():
         try:
-            headers = {
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {api_key}"
-            }
-            payload = {
-                "model": "gemma-4",
-                "messages": [
-                    {"role": "system", "content": GEMMA_SYSTEM_PROMPT},
-                    {"role": "user", "content": user_message}
-                ],
-                "max_tokens": 400
-            }
-            r = requests.post(
-                "https://generativelanguage.googleapis.com/v1beta/models/gemma-4:generateContent",
-                headers=headers,
-                json=payload,
+            resp = requests.post(
+                "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key.strip()}"
+                },
+                json={
+                    "model": "gemma-4-9b-it",
+                    "messages": [
+                        {"role": "system", "content": GEMMA_SYSTEM_PROMPT},
+                        {"role": "user", "content": user_msg}
+                    ],
+                    "max_tokens": 500
+                },
                 timeout=30
             )
-            if r.status_code == 200:
-                return r.json()["candidates"][0]["content"]["parts"][0]["text"]
+            if resp.status_code == 200:
+                return resp.json()["choices"][0]["message"]["content"]
         except:
             pass
 
-    # Fallback: rule-based response (same logic as Gemma would use)
-    level, emoji = risk_level(delta)
+    # Fallback rule-based (same logic as Gemma would apply)
     if delta is None:
-        return f"""🌍 Location: {location_name}
-⚡ Risk Level: UNKNOWN {emoji}
-📊 Gap Parameter Delta: insufficient data
-📝 Analysis: Not enough seismic events in this region to compute a reliable Gap Parameter. This may indicate low natural seismicity or sparse monitoring coverage.
-✅ Recommendation: Check back in a few days, or expand the search radius."""
+        return f"""🌍 Location: {location}
+⚡ Risk Level: UNKNOWN ⚪
+📊 Gap Parameter Δ: insufficient data
+📝 Analysis: Not enough seismic events in this region to compute a reliable Gap Parameter. This typically indicates low background seismicity or sparse sensor coverage.
+✅ Recommendation: No action needed. Check back in a few days or try a wider search radius."""
 
     if level == "LOW":
-        analysis = f"The Gap Parameter Delta={delta:.4f} indicates that seismic frequency ratios in this region are highly irrational. This corresponds to a stable phase configuration with no signs of resonant buildup. Historical data shows this pattern precedes quiet periods."
-        rec = "No action needed. Continue normal activities. You can check back in 7 days."
+        analysis = (f"Gap Parameter Δ={delta:.4f} indicates highly irrational inter-event frequency ratios. "
+                   f"The seismic phase configuration is stable — no resonant buildup detected. "
+                   f"This pattern is consistent with normal background activity.")
+        rec = "No action needed. Normal activities can continue. Check again in 7 days."
     elif level == "WATCH":
-        analysis = f"The Gap Parameter Delta={delta:.4f} shows frequency ratios are approaching rational values. This is an intermediate state — not alarming, but worth monitoring. The system is transitioning from a stable to a more resonant configuration."
-        rec = "Stay informed. Check local civil protection updates. Ensure your emergency kit is ready."
+        analysis = (f"Gap Parameter Δ={delta:.4f} shows frequency ratios approaching rational values. "
+                   f"The system is in an intermediate state — not alarming, but worth monitoring. "
+                   f"Historical data suggests continued tracking over the next 2-4 weeks.")
+        rec = "Stay informed via local civil protection. Ensure your emergency kit is current."
     else:
-        analysis = f"The Gap Parameter Delta={delta:.4f} is critically low — frequency ratios are nearly rational. In validated cases (Ridgecrest 2019, Tohoku 2011), similar values preceded significant seismic events within 30-90 days."
-        rec = "Review your emergency preparedness. Know your evacuation routes. Follow official civil protection channels."
+        analysis = (f"Gap Parameter Δ={delta:.4f} is critically low — inter-event frequency ratios are nearly rational. "
+                   f"In validated cases (Ridgecrest M7.1 2019, Tohoku M9.0 2011), similar Δ values preceded "
+                   f"significant activity within 30–90 days.")
+        rec = "Review emergency preparedness. Know your evacuation routes. Follow official civil protection channels."
 
-    return f"""🌍 Location: {location_name}
+    return f"""🌍 Location: {location}
 ⚡ Risk Level: {level} {emoji}
-📊 Gap Parameter Delta: {delta:.4f}
+📊 Gap Parameter Δ: {delta:.4f}
 📝 Analysis: {analysis}
 ✅ Recommendation: {rec}"""
 
 
 # ─────────────────────────────────────────
-# UI
+# MAP
 # ─────────────────────────────────────────
-st.title("🌍 PhaseAlert")
-st.markdown("**Seismic risk assessment powered by number theory and Gemma 4**")
+def make_map(center_lat, center_lon, events, location_name):
+    """Generate folium map HTML"""
+    try:
+        import folium
+
+        m = folium.Map(
+            location=[center_lat, center_lon],
+            zoom_start=6,
+            tiles="CartoDB dark_matter"
+        )
+
+        # Center marker
+        folium.Marker(
+            [center_lat, center_lon],
+            popup=f"📍 {location_name}",
+            icon=folium.Icon(color='blue', icon='home', prefix='fa')
+        ).add_to(m)
+
+        # Earthquake markers
+        for e in events:
+            mag = e['magnitude']
+            radius = max(4, mag * 3)
+            color = '#dc3545' if mag >= 5 else ('#ffc107' if mag >= 4 else '#28a745')
+            folium.CircleMarker(
+                location=[e['lat'], e['lon']],
+                radius=radius,
+                color=color,
+                fill=True,
+                fill_opacity=0.7,
+                popup=folium.Popup(
+                    f"M{mag} — {e['place']}<br>{e['time'].strftime('%Y-%m-%d %H:%M UTC')}",
+                    max_width=200
+                )
+            ).add_to(m)
+
+        return m._repr_html_()
+    except Exception as ex:
+        return f"<p>Map unavailable: {ex}</p>"
+
+
+# ─────────────────────────────────────────
+# MAIN UI
+# ─────────────────────────────────────────
+st.markdown("""
+<div style="text-align:center; padding: 20px 0 10px 0;">
+  <h1 style="font-size:2.8rem; margin:0;">🌍 PhaseAlert</h1>
+  <p style="color:#8899aa; font-family:'Space Mono',monospace; font-size:0.85rem; margin:4px 0 0 0;">
+    SEISMIC RISK · GAP PARAMETER · POWERED BY GEMMA 4
+  </p>
+</div>
+""", unsafe_allow_html=True)
+
 st.markdown("---")
 
-col1, col2 = st.columns([2, 1])
-
+col1, col2 = st.columns([3, 1])
 with col1:
     location_input = st.text_input(
-        "📍 Enter a location",
-        placeholder="e.g. Tokyo, Los Angeles, Istanbul...",
-        help="City name or region"
+        "📍 Location",
+        placeholder="Tokyo, Istanbul, Los Angeles, Rome...",
+        label_visibility="collapsed"
     )
-
 with col2:
-    api_key = st.text_input(
-        "🔑 Gemma 4 API key (optional)",
-        type="password",
-        help="Leave empty to use built-in analysis"
-    )
+    analyze = st.button("🔍 Analyze", use_container_width=True, type="primary")
 
-if st.button("🔍 Analyze Seismic Risk", type="primary", use_container_width=True):
+with st.expander("🔑 Gemma 4 API key (optional — for full AI analysis)"):
+    api_key = st.text_input("API Key", type="password", label_visibility="collapsed",
+                            help="Get free key at aistudio.google.com")
+
+st.markdown("---")
+
+if analyze:
     if not location_input.strip():
         st.warning("Please enter a location.")
     else:
         with st.spinner(f"Locating {location_input}..."):
-            lat, lon, full_name = geocode_location(location_input)
+            lat, lon, full_name = geocode(location_input)
 
         if lat is None:
-            st.error("Could not find this location. Try a different spelling.")
-        else:
-            with st.spinner("Fetching seismic data from USGS..."):
-                events, error = fetch_usgs_events(lat, lon)
+            st.error("Location not found. Try another spelling.")
+            st.stop()
 
-            if error:
-                st.error(f"USGS data error: {error}")
+        with st.spinner("Fetching USGS seismic data..."):
+            events, err = fetch_usgs(lat, lon)
+
+        if err:
+            st.error(f"USGS error: {err}")
+            st.stop()
+
+        with st.spinner("Computing Gap Parameter Δ..."):
+            delta, all_deltas = compute_delta(events)
+
+        with st.spinner("Gemma 4 analyzing..."):
+            level, emoji_r, color = risk_level(delta)
+            response = call_gemma(
+                full_name or location_input,
+                lat, lon, events, delta,
+                api_key if api_key else None
+            )
+
+        # ── RISK BANNER ──
+        st.markdown(
+            f'<div class="risk-banner" style="background:{color}22; '
+            f'border:2px solid {color}; color:{color};">'
+            f'{emoji_r} {level} RISK</div>',
+            unsafe_allow_html=True
+        )
+
+        # ── TWO COLUMNS: analysis + map ──
+        left, right = st.columns([1, 1])
+
+        with left:
+            st.markdown("### 🤖 Gemma 4 Analysis")
+            st.markdown(
+                f'<div class="analysis-box">{response.replace(chr(10), "<br>")}</div>',
+                unsafe_allow_html=True
+            )
+
+            # Metrics
+            m1, m2, m3 = st.columns(3)
+            m1.metric("Events", len(events))
+            m2.metric("Δ (min)", f"{delta:.4f}" if delta else "N/A")
+            m3.metric("Risk", level)
+
+        with right:
+            st.markdown("### 🗺️ Seismic Map")
+            if events:
+                map_html = make_map(lat, lon, events, location_input)
+                st.components.v1.html(map_html, height=340)
             else:
-                with st.spinner("Computing Gap Parameter..."):
-                    delta, all_deltas = compute_delta_from_events(events)
+                st.info("No events to map in this region.")
 
-                with st.spinner("Gemma 4 is analyzing..."):
-                    level, emoji = risk_level(delta)
-                    response = call_gemma(
-                        full_name or location_input,
-                        lat, lon, events, delta, level,
-                        api_key if api_key else None
-                    )
+        # ── DELTA TREND ──
+        if all_deltas and len(all_deltas) > 2:
+            st.markdown("### 📈 Gap Parameter Δ Trend")
+            df_d = pd.DataFrame({
+                "Δ (Gap Parameter)": all_deltas,
+                "High Risk Threshold": [0.010] * len(all_deltas),
+                "Watch Threshold": [0.030] * len(all_deltas),
+            })
+            st.line_chart(df_d)
+            st.caption(
+                "Δ < 0.010 (red zone): frequency ratios nearly rational — "
+                "historical precursor to elevated seismic activity. "
+                "Validated on Ridgecrest 2019 and Tohoku 2011."
+            )
 
-                # ── RESULTS ──
-                st.markdown("---")
+        # ── EVENTS TABLE ──
+        if events:
+            st.markdown("### 📋 Recent Events (last 30 days)")
+            df = pd.DataFrame([{
+                "Date (UTC)": e["time"].strftime("%Y-%m-%d %H:%M"),
+                "M": e["magnitude"],
+                "Location": e["place"],
+                "Depth km": e["depth"]
+            } for e in events[:15]])
+            st.dataframe(df, use_container_width=True, hide_index=True)
 
-                # Risk banner
-                colors = {"LOW": "#28a745", "WATCH": "#ffc107", "HIGH": "#dc3545", "UNKNOWN": "#6c757d"}
-                color = colors.get(level, "#6c757d")
-                st.markdown(
-                    f'<div style="background:{color};color:white;padding:20px;border-radius:10px;'
-                    f'text-align:center;font-size:28px;font-weight:bold;">'
-                    f'{emoji} {level} RISK</div>',
-                    unsafe_allow_html=True
-                )
-                st.markdown("")
-
-                # Gemma response
-                st.markdown("### 🤖 Gemma 4 Analysis")
-                st.markdown(response)
-
-                # Stats
-                st.markdown("---")
-                c1, c2, c3 = st.columns(3)
-                c1.metric("Events analyzed", len(events), help="Last 30 days, 500km radius")
-                c2.metric("Gap Parameter Δ", f"{delta:.4f}" if delta else "N/A")
-                c3.metric("Risk Level", level)
-
-                # Recent events table
-                if events:
-                    st.markdown("### 📋 Recent Seismic Events")
-                    import pandas as pd
-                    df = pd.DataFrame([{
-                        "Date": e["time"].strftime("%Y-%m-%d %H:%M"),
-                        "Magnitude": e["magnitude"],
-                        "Location": e["place"],
-                        "Depth (km)": e["depth"]
-                    } for e in events[:10]])
-                    st.dataframe(df, use_container_width=True)
-
-                # Delta chart
-                if all_deltas:
-                    st.markdown("### 📈 Gap Parameter Trend")
-                    import pandas as pd
-                    df_delta = pd.DataFrame({"Delta": all_deltas})
-                    st.line_chart(df_delta)
-                    st.caption(
-                        "When Delta drops below 0.010 (red zone), "
-                        "frequency ratios become nearly rational — "
-                        "historically correlated with elevated seismic activity."
-                    )
+        st.markdown(f"""
+<div style="color:#556677; font-size:0.75rem; text-align:center; margin-top:20px;">
+Based on the Toroidal Phase Metric framework · Nicolae Pascal, Zenodo 2025-2026<br>
+Data: USGS Earthquake Hazards Program · For informational purposes only
+</div>
+""", unsafe_allow_html=True)
 
 # ── SIDEBAR ──
 with st.sidebar:
-    st.markdown("## How PhaseAlert works")
+    st.markdown("## ⚙️ How it works")
     st.markdown("""
-**1. Locate** your city or region
+**Step 1** — Enter any city
 
-**2. Fetch** recent seismic events from USGS (open data)
+**Step 2** — USGS live data fetched automatically
 
-**3. Compute** the Gap Parameter Δ — a number theory measure of how irrational the frequency ratios between events are
+**Step 3** — Gap Parameter Δ computed from inter-event frequency ratios
 
-**4. Gemma 4 analyzes** the pattern and explains the risk in your language
-
----
-**The Science:**
-
-When seismic events cluster at rational-ratio time intervals, it signals resonant buildup — similar to standing waves in a cavity.
-
-The Gap Parameter Δ = min|r - p/q| measures how far frequency ratios are from rational numbers.
-
-Low Δ → near-rational → elevated risk  
-High Δ → irrational → stable
+**Step 4** — Gemma 4 interprets and explains
 
 ---
-**Validated on:**
-- Ridgecrest 2019 (M7.1): Δ = 0.007
-- Tohoku 2011 (M9.0): Δ = 0.004
+### The Math
+
+**Δ = min|r − p/q|**
+
+where r = ratio of consecutive inter-event intervals, p/q = best rational approximation (q ≤ 15)
+
+When Δ is small, seismic intervals cluster near rational ratios — a resonant state historically preceding elevated activity.
 
 ---
-*Based on the Toroidal Phase Metric framework by Nicolae Pascal (Zenodo, 2025-2026)*
+### Validated Cases
+
+| Event | Δ before | Outcome |
+|-------|----------|---------|
+| Ridgecrest M7.1 | 0.007 | 72h later |
+| Tohoku M9.0 | 0.004 | 96h later |
+
+---
+### Tracks
+
+🌐 **Global Resilience**
+🛡️ **Safety & Trust**
+
+---
+*Gemma 4 Good Hackathon 2026*
     """)
-
-    st.markdown("---")
-    st.markdown("**Tracks:** Global Resilience · Safety & Trust")
-    st.markdown("**Model:** Gemma 4 (Google DeepMind)")
-  
+    
