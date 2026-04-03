@@ -220,18 +220,18 @@ def fetch_usgs(lat, lon, radius_km=200, days=30, min_mag=2.0):
     attempts = [
         (radius_km, days, min_mag),
         (radius_km * 2, days, min_mag),
-        (500, days, 1.5),
+        (500, days, 1.0),
+        (500, 60, 0.5),
     ]
-    last_err = "No data"
     for r, d, m in attempts:
         try:
             events = fetch_raw(lat, lon, r, d, m)
-            if len(events) >= 8:
+            if len(events) >= 10:
                 return events, None
-        except Exception as exc:
-            last_err = str(exc)
+        except Exception:
+            pass
     try:
-        return fetch_raw(lat, lon, 500, 30, 1.5), None
+        return fetch_raw(lat, lon, 500, 60, 0.5), None
     except Exception as exc:
         return [], str(exc)
 
@@ -351,8 +351,19 @@ if analyze:
         st.stop()
 
     if not events:
-        st.warning("No seismic events found in this region (last 30 days, M>=2.0, 200km radius).")
+        st.warning(
+            "No seismic events found for " + location_input + " in the USGS global catalog. "
+            "The global catalog covers M>=2.5 events. For best results try: "
+            "Japan, Chile, Alaska, Indonesia, Greece, Turkey, New Zealand."
+        )
         st.stop()
+
+    if len(events) < 8:
+        st.warning(
+            "Only " + str(len(events)) + " events found. "
+            "Delta_mean analysis requires at least 8 events for reliable results. "
+            "Try a more seismically active region: Japan, Chile, Alaska, Indonesia."
+        )
 
     with st.spinner("Computing Delta_mean..."):
         dm_bg, dm_rec, n_bg, n_rec, level = compute_risk(events)
@@ -398,4 +409,4 @@ if analyze:
 with st.sidebar:
     st.markdown("## How PhaseAlert works")
     st.markdown("**The Method**\n\nDelta_mean measures how irrational the timing between earthquakes is.\n\n**Formula:**\n`Delta(r) = min|r - p/q|`\nfor 1 <= p,q <= 20, where r = ratio of consecutive inter-event intervals.\n\n**The Signal**\n\nNOT the absolute value -- but the **TREND**.\n\nWhen Delta_mean drops, the seismic system is locking into resonant quasi-periodic stress-release cycles.\n\n---\n**Validated on:**\n\n| Event | Drop | Time |\n|-------|------|------|\n| Ridgecrest M7.1 | 61% | 5 hours |\n| Tohoku M9.0 | 88% | 6 hours |\n\n---\n**Risk Levels**\n\n🟢 LOW -- stable\n\n🟡 WATCH -- 20-50% drop\n\n🔴 HIGH -- over 50% drop\n\n---\n*Gemma 4 Good Hackathon 2026*\n*Global Resilience | Safety and Trust*")
-            
+                
