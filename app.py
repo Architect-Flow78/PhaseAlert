@@ -4,7 +4,6 @@ import math
 import pandas as pd
 import numpy as np
 from datetime import datetime, timedelta, timezone
-import numpy as np # Explicitly importing numpy here just to be safe
 from sklearn.cluster import DBSCAN
 
 # Define constants for clarity
@@ -60,16 +59,19 @@ def delta_mean_for_events(evlist):
     ds = [d for d in ds if d is not None]
     return float(np.mean(ds)) if ds else None
 
-def compute_drop(events):
+def compute_drop(events, now_time):
     if not events:
         return None, None, None, "UNKNOWN"
-    now = max(e["time"] for e in events)
-    bg = [e for e in events if timedelta(days=BACKGROUND_START_OFFSET_DAYS) <= (now - e["time"]) <= timedelta(days=BACKGROUND_DAYS)]
-    rec = [e for e in events if (now - e["time"]) <= timedelta(days=RECENT_DAYS)]
+    
+    bg = [e for e in events if timedelta(days=BACKGROUND_START_OFFSET_DAYS) <= (now_time - e["time"]) <= timedelta(days=BACKGROUND_DAYS)]
+    rec = [e for e in events if (now_time - e["time"]) <= timedelta(days=RECENT_DAYS)]
+    
     dm_bg = delta_mean_for_events(bg)
     dm_rec = delta_mean_for_events(rec)
+    
     if dm_bg is None or dm_rec is None:
         return dm_bg, dm_rec, None, "UNKNOWN"
+    
     drop = (dm_bg - dm_rec) / dm_bg * 100.0 if dm_bg > 0 else 0.0
     level = "HIGH" if drop > DROP_THRESHOLD_HIGH else ("WATCH" if drop > DROP_THRESHOLD_WATCH else "LOW")
     return dm_bg, dm_rec, drop, level
@@ -81,9 +83,14 @@ def risk_emoji(level):
     return {"HIGH":"🔴","WATCH":"🟡","LOW":"🟢","UNKNOWN":"⚪"}.get(level,"⚪")
 
 @st.cache_data(ttl=1800)
-def fetch_global_events():
-    end_t = datetime.now(timezone.utc)
+def fetch_global_events(target_date_str=None):
+    if target_date_str:
+        end_t = datetime.strptime(target_date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    else:
+        end_t = datetime.now(timezone.utc)
+        
     start_t = end_t - timedelta(days=BACKGROUND_DAYS)
+    
     try:
         resp = requests.get(
             "https://earthquake.usgs.gov/fdsnws/event/1/query",
@@ -106,45 +113,34 @@ def fetch_global_events():
                     "lat": float(c[1]),
                     "lon": float(c[0]),
                 })
-        return events, None
+        return events, None, end_t
     except Exception as exc:
-        return [], str(exc)
+        return [], str(exc), None
 
-# ─── New DBSCAN Analysis Function ───────────────────────────────────────────
-def analyze_dbscan(all_events):
+def analyze_dbscan(all_events, now_time):
     if len(all_events) < MIN_CLUSTER_SIZE:
         return []
     
-    # 1. Prepare data (coordinates in degrees for simplicity, though radians is better)
     coords = np.array([[e['lat'], e['lon']] for e in all_events])
     
-    # 2. Run DBSCAN
-    # eps=0.5 degrees is a coarse approximation. It works well for identifying swarms.
     db = DBSCAN(eps=0.5, min_samples=MIN_CLUSTER_SIZE, metric='euclidean').fit(coords)
     labels = db.labels_
     
-    # 3. Process clusters
     unique_labels = set(labels)
     zones = []
     
     for label in unique_labels:
-        # Ignore noise (-1)
         if label == -1: continue
         
-        # Get subset of events for this cluster
         class_member_mask = (labels == label)
         cluster_coords = coords[class_member_mask]
         cluster_indices = np.where(class_member_mask)[0]
         
-        # Original logic to compute drop on the cluster events
         cluster_events = [all_events[idx] for idx in cluster_indices]
-        dm_bg, dm_rec, drop, level = compute_drop(cluster_events)
+        dm_bg, dm_rec, drop, level = compute_drop(cluster_events, now_time)
         
         if level in ("HIGH", "WATCH"):
-            # Compute centroid of cluster
             center_lat, center_lon = cluster_coords.mean(axis=0)
-            
-            # Additional summary stats
             max_mag = max(e["magnitude"] for e in cluster_events)
             
             zones.append({
@@ -155,25 +151,22 @@ def analyze_dbscan(all_events):
                 "dm_bg": dm_bg, "dm_rec": dm_rec,
                 "events": cluster_events,
                 "place": cluster_events[0]["place"] if cluster_events else "Unknown",
-                "cluster_label": label, # for debugging if needed
+                "cluster_label": label,
             })
             
-    # 4. Sort and return
     zones.sort(key=lambda z: z["drop"] or 0, reverse=True)
     return zones
 
-# ─── Fix for Black Map (Updated tiles) ───────────────────────────────────────
 def make_world_map(zones, all_events):
     try:
         import folium
         m = folium.Map(
             location=[20, 0], zoom_start=2,
-            tiles='CartoDB dark_matter', # Updated tileset for better stability/style
+            tiles='CartoDB dark_matter',
             attr="CartoDB | USGS",
             width="100%", height="100%",
         )
 
-        # Background dots for strongest all events
         for e in all_events:
             mag = e["magnitude"]
             if mag >= 6.0:
@@ -184,13 +177,12 @@ def make_world_map(zones, all_events):
                     weight=0.5,
                 ).add_to(m)
 
-        # Risk zone circles
         for z in zones:
             color = risk_color(z["level"])
             drop_str = str(round(z["drop"],1)) if z["drop"] else "N/A"
             folium.CircleMarker(
                 location=[z["lat"], z["lon"]],
-                radius=max(18, z["n_events"] / 3), # slight scaling adjustment
+                radius=max(18, z["n_events"] / 3),
                 color=color,
                 fill=True,
                 fill_color=color,
@@ -246,7 +238,6 @@ def call_gemma(zones, total_events, api_key=None):
         except Exception:
             pass
 
-    # Fallback
     high_regions = ", ".join([z["place"].split(",")[-1].strip() for z in high[:3]]) if high else "none"
     watch_regions = ", ".join([z["place"].split(",")[-1].strip() for z in watch[:3]]) if watch else "none"
     return (
@@ -262,7 +253,6 @@ def call_gemma(zones, total_events, api_key=None):
 
 # ─── UI ───────────────────────────────────────────────────────────────────────
 
-# Hero header
 st.markdown(
     "<div style='text-align:center;padding:30px 0 10px 0;'>"
     "<div style='font-size:4rem;margin-bottom:8px;'>🌍</div>"
@@ -280,6 +270,13 @@ st.markdown("---")
 
 col_a, col_b, col_c = st.columns([1,2,1])
 with col_b:
+    use_history = st.checkbox("🕰️ Режим Бэктестинга (Проверить прошлые даты)", value=False)
+    
+    target_date_str = None
+    if use_history:
+        selected_date = st.date_input("Выберите дату (система проанализирует 30 дней ДО нее)")
+        target_date_str = selected_date.strftime("%Y-%m-%d")
+
     scan_btn = st.button("🔍 SCAN PLANET NOW (DBSCAN METHOD)", use_container_width=True, type="primary")
 
 with st.expander("🔑 Gemma 4 API key (optional)"):
@@ -289,43 +286,40 @@ st.markdown("---")
 
 if scan_btn:
     with st.spinner("Downloading global seismic catalog from USGS..."):
-        all_events, err = fetch_global_events()
+        all_events, err, analysis_end_time = fetch_global_events(target_date_str)
 
     if err or not all_events:
         st.error("Could not fetch USGS data: " + (err or "empty response"))
         st.stop()
 
     with st.spinner("Analyzing " + str(len(all_events)) + " events using DBSCAN clustering..."):
-        # Updated call to new function
-        zones = analyze_dbscan(all_events)
+        zones = analyze_dbscan(all_events, analysis_end_time)
 
     high_zones = [z for z in zones if z["level"] == "HIGH"]
     watch_zones = [z for z in zones if z["level"] == "WATCH"]
 
-    # Stats bar
     s1, s2, s3, s4 = st.columns(4)
     s1.markdown("<div class='stat-box'><div style='color:#8899aa;font-size:0.75rem;'>EVENTS ANALYZED</div><div style='font-size:1.8rem;font-weight:700;color:white;'>" + str(len(all_events)) + "</div></div>", unsafe_allow_html=True)
     s2.markdown("<div class='stat-box'><div style='color:#8899aa;font-size:0.75rem;'>HIGH RISK ZONES</div><div style='font-size:1.8rem;font-weight:700;color:#dc3545;'>" + str(len(high_zones)) + "</div></div>", unsafe_allow_html=True)
     s3.markdown("<div class='stat-box'><div style='color:#8899aa;font-size:0.75rem;'>WATCH ZONES</div><div style='font-size:1.8rem;font-weight:700;color:#ffc107;'>" + str(len(watch_zones)) + "</div></div>", unsafe_allow_html=True)
-    s4.markdown("<div class='stat-box'><div style='color:#8899aa;font-size:0.75rem;'>SCAN TIME (UTC)</div><div style='font-size:1rem;font-weight:700;color:white;'>" + datetime.now(timezone.utc).strftime("%H:%M") + "</div></div>", unsafe_allow_html=True)
+    
+    display_time = analysis_end_time.strftime("%Y-%m-%d %H:%M") if target_date_str else datetime.now(timezone.utc).strftime("%H:%M")
+    s4.markdown("<div class='stat-box'><div style='color:#8899aa;font-size:0.75rem;'>TARGET TIME (UTC)</div><div style='font-size:1rem;font-weight:700;color:white;'>" + display_time + "</div></div>", unsafe_allow_html=True)
 
     st.markdown("")
 
-    # Gemma analysis
     with st.spinner("Gemma 4 good hackathon AI analyzing patterns..."):
         analysis = call_gemma(zones, len(all_events), api_key if api_key else None)
 
     st.markdown("### 🤖 Gemma 4 Global Risk Assessment")
     st.markdown("<div class='analysis-box'>" + analysis.replace("\n","<br>") + "</div>", unsafe_allow_html=True)
 
-    # World map
     st.markdown("### 🗺️ Fault-based Global Risk Map (DBSCAN Clustered)")
     st.caption("🔴 HIGH RISK (Delta_mean drop >50%) | 🟡 WATCH (drop 20-50%) | Map uses 'CartoDB dark_matter' tiles")
     with st.spinner("Rendering world map..."):
         map_html = make_world_map(zones, all_events)
     st.components.v1.html(map_html, height=450)
 
-    # Top zones
     if zones:
         st.markdown("### ⚡ Top Clustered Risk Zones")
         cols = st.columns(min(3, len(zones[:6])))
@@ -344,8 +338,7 @@ if scan_btn:
                     unsafe_allow_html=True,
                 )
 
-    # Top events table
-    st.markdown("### 📋 Strongest Recent Events (M>=5)")
+    st.markdown("### 📋 Strongest Events in Target Period (M>=5)")
     big = sorted([e for e in all_events if e["magnitude"] >= 5.0], key=lambda x: x["magnitude"], reverse=True)[:15]
     if big:
         df = pd.DataFrame([{"Date":e["time"].strftime("%Y-%m-%d %H:%M"),"M":e["magnitude"],"Location":e["place"],"Depth km":e["depth"]} for e in big])
@@ -353,20 +346,18 @@ if scan_btn:
 
     st.markdown(
         "<div style='color:#556677;font-size:0.75rem;text-align:center;margin-top:20px;'>"
-        "Method: Pascal (2026) Rationality Gap | Core Logic: Autopoietic Phase Stabilization | "
-        "Data: USGS FDSN Global Catalog | Clustering: DBSCAN | "
-        "For informational purposes only | Not a substitute for official warnings"
+        "Method: Pascal (2026) Rational Gap | Core Logic: Autopoietic Phase Stabilization | "
+        "Data: USGS FDSN Global Catalog | Clustering: DBSCAN"
         "</div>",
         unsafe_allow_html=True,
     )
 
 else:
-    # Landing state
     st.markdown(
         "<div style='text-align:center;padding:40px 20px;color:#556677;'>"
         "<div style='font-size:3rem;margin-bottom:16px;'>🌐</div>"
         "<p style='font-size:1.1rem;'>Press SCAN PLANET NOW to analyze global seismic activity using DBSCAN</p>"
-        "<p style='font-size:0.85rem;'>Downloads ~5000 recent events from USGS and detects fault-based clusters where</p>"
+        "<p style='font-size:0.85rem;'>Downloads ~5000 events from USGS and detects fault-based clusters where</p>"
         "<p style='font-size:0.85rem;'>seismic timing is becoming dangerously regular</p>"
         "<br>"
         "<p style='font-size:0.8rem;color:#334455;'>"
@@ -394,4 +385,4 @@ with st.sidebar:
         "---\n"
         "Submission for Gemma 4 Good Hackathon 2026\n\n"
         "Global Resilience | Safety and Trust"
-                         )
+                                )
